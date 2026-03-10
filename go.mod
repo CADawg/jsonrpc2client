@@ -1,4 +1,4 @@
-module github.com/cfoxon/jsonrpc2client
+module github.com/cadawg/jsonrpc2client
 
 go 1.24.0
 
