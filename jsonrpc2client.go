@@ -134,24 +134,28 @@ func (client *rpcClient) doBatchCall(rpcRequests []*RpcRequest) ([]*RpcResponse,
 	var wait sync.WaitGroup
 	wait.Add(numWorkers)
 
+	var mu sync.Mutex
 	rpcResponses := RpcResponses{}
 
 	work := func(rpcRequest RPCRequests) {
-		rpcResponse := RpcResponses{}
 		httpRequest, err := client.newRequest(rpcRequest)
 		if err != nil {
 			log.Printf("%v", err)
-			rpcResponse = RpcResponses{&RpcResponse{Error: &RpcError{Message: err.Error()}}}
-			rpcResponses = append(rpcResponses, rpcResponse...)
+			mu.Lock()
+			rpcResponses = append(rpcResponses, &RpcResponse{Error: &RpcError{Message: err.Error()}})
+			mu.Unlock()
 			return
 		}
 		httpRequest.Header.Set("Accept-Encoding", "gzip")
 		res := fasthttp.AcquireResponse()
 
-		if err2 := fasthttp.Do(httpRequest, res); err != nil {
+		if err2 := fasthttp.Do(httpRequest, res); err2 != nil {
+			fasthttp.ReleaseRequest(httpRequest)
+			fasthttp.ReleaseResponse(res)
 			log.Printf("%v", err2)
-			rpcResponse = RpcResponses{&RpcResponse{Error: &RpcError{Message: err2.Error()}}}
-			rpcResponses = append(rpcResponses, rpcResponse...)
+			mu.Lock()
+			rpcResponses = append(rpcResponses, &RpcResponse{Error: &RpcError{Message: err2.Error()}})
+			mu.Unlock()
 			return
 		}
 		fasthttp.ReleaseRequest(httpRequest)
@@ -164,17 +168,22 @@ func (client *rpcClient) doBatchCall(rpcRequests []*RpcRequest) ([]*RpcResponse,
 			body = res.Body()
 		}
 
-		if err3 := json.Unmarshal(body, &rpcResponse); err != nil {
-			log.Printf("%v", err)
-			rpcResponse = RpcResponses{&RpcResponse{Error: &RpcError{Message: err3.Error()}}}
-			rpcResponses = append(rpcResponses, rpcResponse...)
+		var batchResponse RpcResponses
+		if err3 := json.Unmarshal(body, &batchResponse); err3 != nil {
+			fasthttp.ReleaseResponse(res)
+			log.Printf("%v", err3)
+			mu.Lock()
+			rpcResponses = append(rpcResponses, &RpcResponse{Error: &RpcError{Message: err3.Error()}})
+			mu.Unlock()
 			return
 		}
-
-		if len(rpcResponse) > 0 {
-			rpcResponses = append(rpcResponses, rpcResponse...)
-		}
 		fasthttp.ReleaseResponse(res)
+
+		if len(batchResponse) > 0 {
+			mu.Lock()
+			rpcResponses = append(rpcResponses, batchResponse...)
+			mu.Unlock()
+		}
 	}
 
 	worker := func(ch <-chan RPCRequests) {
@@ -211,7 +220,6 @@ func (client *rpcClient) doFastBatchCall(rpcRequests []*RpcRequest) ([][]byte, e
 		var pendingBatch RPCRequests
 		pendingBatch = batch
 		pendingRpcReqs <- pendingBatch
-		batch = nil
 	}
 	close(pendingRpcReqs)
 
@@ -220,25 +228,26 @@ func (client *rpcClient) doFastBatchCall(rpcRequests []*RpcRequest) ([][]byte, e
 		numWorkers = reqs
 	}
 
-	resc := make(chan []byte)
+	var wait sync.WaitGroup
+	wait.Add(numWorkers)
+
+	var mu sync.Mutex
+	var rpcResponses [][]byte
+
 	work := func(rpcRequest RPCRequests) {
 		httpRequest, err := client.newRequest(rpcRequest)
 		if err != nil {
 			log.Printf("%v", err)
-			respErr := RpcResponses{&RpcResponse{Error: &RpcError{Message: err.Error()}}}
-			respErrB, _ := json.Marshal(respErr)
-			resc <- respErrB
 			return
 		}
 
 		res := fasthttp.AcquireResponse()
 		httpRequest.Header.Set("Accept-Encoding", "gzip")
 
-		if err2 := fasthttp.Do(httpRequest, res); err != nil {
+		if err2 := fasthttp.Do(httpRequest, res); err2 != nil {
+			fasthttp.ReleaseRequest(httpRequest)
+			fasthttp.ReleaseResponse(res)
 			log.Printf("%v", err2)
-			respErr := RpcResponses{&RpcResponse{Error: &RpcError{Message: err2.Error()}}}
-			respErrB, _ := json.Marshal(respErr)
-			resc <- respErrB
 			return
 		}
 		fasthttp.ReleaseRequest(httpRequest)
@@ -246,18 +255,26 @@ func (client *rpcClient) doFastBatchCall(rpcRequests []*RpcRequest) ([][]byte, e
 		contentEncoding := res.Header.Peek("Content-Encoding")
 		var body []byte
 		if bytes.EqualFold(contentEncoding, []byte("gzip")) {
+			// BodyGunzip allocates a new slice, safe to use after ReleaseResponse.
 			body, _ = res.BodyGunzip()
 		} else {
-			body = res.Body()
-		}
-
-		if len(body) > 0 {
-			resc <- body
+			// res.Body() returns a reference into the response's internal buffer.
+			// Copy before releasing so the caller gets stable memory.
+			src := res.Body()
+			body = make([]byte, len(src))
+			copy(body, src)
 		}
 		fasthttp.ReleaseResponse(res)
+
+		if len(body) > 0 {
+			mu.Lock()
+			rpcResponses = append(rpcResponses, body)
+			mu.Unlock()
+		}
 	}
 
 	worker := func(ch <-chan RPCRequests) {
+		defer wait.Done()
 		for j := range ch {
 			work(j)
 		}
@@ -266,13 +283,7 @@ func (client *rpcClient) doFastBatchCall(rpcRequests []*RpcRequest) ([][]byte, e
 		go worker(pendingRpcReqs)
 	}
 
-	var rpcResponses [][]byte
-	for i := 0; i < numWorkers; i++ {
-		b := <-resc
-		rpcResponses = append(rpcResponses, b)
-	}
-	close(resc)
-
+	wait.Wait()
 	return rpcResponses, nil
 }
 
